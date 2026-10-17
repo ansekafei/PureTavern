@@ -15,6 +15,7 @@ import { registerImportExportLegacyRoutes } from './legacy/register-routes';
 import type { BackupRepository } from './ports/backup-repository';
 import type { BackupTransport } from './ports/backup-transport';
 import { installDataManagementRuntimeBridge } from './runtime-bridge';
+import { installSyncVaultBridge } from './sync/sync-bridge';
 import { TauriTavernMigrationService } from './tauri-tavern/application/tauri-tavern-service';
 
 export interface DataManagementRuntimeCapability {
@@ -62,6 +63,8 @@ export function createImportExportFeature(options: ImportExportFeatureOptions = 
       });
       registerImportExportLegacyRoutes(context.router, service, tauriTavern);
       installDataManagementRuntimeBridge(service, tauriTavern);
+      // 云端同步是可选的：没解锁就是 null，面板据此只显示「未连接」。
+      installSyncVaultBridge(service);
 
       const participantDiagnostics = {
         get count() {

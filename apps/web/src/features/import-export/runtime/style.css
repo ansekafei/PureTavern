@@ -227,3 +227,42 @@
 .ptdm-hidden {
   display: none !important;
 }
+
+/* 云端同步 */
+
+.ptdm-check {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+  white-space: nowrap;
+  font-size: 0.93em;
+}
+
+#ptdm-sync-endpoint {
+  min-width: 22rem;
+  font-family: ui-monospace, monospace;
+}
+
+#ptdm-sync-username,
+#ptdm-sync-password {
+  min-width: 10rem;
+}
+
+/* 快照名是唯一一个「可以随便留空」的输入框，不给它占满整行的宽度。 */
+#ptdm-sync-label {
+  min-width: 12rem;
+}
+
+#ptdm-sync-list {
+  display: flex;
+  flex-direction: column;
+  margin-top: 0.5rem;
+}
+
+#ptdm-sync-list > :only-child {
+  padding: 0.45rem;
+}
+
+#ptdm-sync-status.ptdm-danger {
+  color: #ffb4b4;
+}

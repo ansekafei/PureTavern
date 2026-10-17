@@ -1,4 +1,4 @@
-/* global fetch, document, setTimeout, location, FormData, AbortController */
+/* global fetch, document, setTimeout, location, FormData, AbortController, File */
 
 const API = '/api/backups/archive';
 const TT_API = '/api/backups/tauritavern';
@@ -10,6 +10,11 @@ const state = {
   ttPreview: null,
   importAbort: null,
   ttImportAbort: null,
+};
+const syncState = {
+  // null = 未解锁。解锁后是 { baseUrl, username, accountId }，只存在内存里。
+  unlocked: null,
+  snapshots: [],
 };
 const IMPORT_METHODS = Object.freeze([
   { value: 'fast', label: '快速导入（高内存占用）' },
@@ -858,6 +863,208 @@ function showReport(report) {
   target.textContent = typeof report === 'string' ? report : JSON.stringify(report, null, 2);
 }
 
+// ── 云端同步 ────────────────────────────────────────────────────────────────
+// 面板只负责显示与收集输入；派生密钥、加解密、HTTP 全在 __PURE_TAVERN_SYNC_VAULT__ 里。
+// 所以这个文件里看不到 password 之外的任何密钥材料，也永远拿不到明文以外的字节。
+
+function syncBridge() {
+  return globalThis.__PURE_TAVERN_SYNC_VAULT__ ?? null;
+}
+
+function syncStatusText() {
+  if (!syncBridge()) return '云端同步模块未加载，请刷新页面。';
+  if (!syncState.unlocked) return '未解锁。解锁后本机不会保存密码，关掉标签页即锁定。';
+  return `已解锁：${syncState.unlocked.username} @ ${syncState.unlocked.baseUrl}`;
+}
+
+function renderSync() {
+  const status = document.querySelector('#ptdm-sync-status');
+  if (!status) return;
+  const unlocked = Boolean(syncState.unlocked);
+  status.textContent = syncStatusText();
+  status.classList.toggle('ptdm-danger', !syncBridge());
+  document.querySelector('#ptdm-sync-actions').classList.toggle('ptdm-hidden', !unlocked);
+  document.querySelector('#ptdm-sync-auth').classList.toggle('ptdm-hidden', unlocked);
+  renderSyncSnapshots();
+}
+
+function renderSyncSnapshots() {
+  const list = document.querySelector('#ptdm-sync-list');
+  if (!list) return;
+  list.replaceChildren();
+  if (!syncState.unlocked) {
+    list.textContent = '解锁后这里会列出云端快照。';
+    return;
+  }
+  for (const snapshot of syncState.snapshots) {
+    const row = document.createElement('div');
+    row.className = 'ptdm-backup-row';
+    const info = document.createElement('div');
+    const title = document.createElement('strong');
+    title.textContent = snapshot.label;
+    const meta = document.createElement('div');
+    meta.className = 'ptdm-module-meta';
+    // 大小显示的是密文体积：云上真正占的字节，明文体积在这里没有意义。
+    meta.textContent = `${new Date(snapshot.createdAt).toLocaleString()} · ${formatBytes(snapshot.size)} · ${snapshot.moduleIds.length} modules${snapshot.includeSecrets ? ' · 含 Secrets' : ''}`;
+    info.append(title, meta);
+    const actions = document.createElement('div');
+    actions.className = 'ptdm-toolbar';
+    actions.append(
+      actionButton('下载到本地', () => downloadSyncSnapshot(snapshot)),
+      actionButton('恢复到本地', () => restoreSyncSnapshot(snapshot)),
+      actionButton('删除云端', () => deleteSyncSnapshot(snapshot), 'menu_button ptdm-danger'),
+    );
+    row.append(info, actions);
+    list.appendChild(row);
+  }
+  if (!list.children.length) list.textContent = '云端还没有快照。点「上传当前数据」创建第一个。';
+}
+
+function selectedSyncLabel() {
+  const value = document.querySelector('#ptdm-sync-label')?.value?.trim();
+  return value || '';
+}
+
+async function unlockSync() {
+  const bridge = syncBridge();
+  if (!bridge) {
+    notify('error', '云端同步模块未加载，请刷新页面。');
+    return;
+  }
+  const baseUrl = document.querySelector('#ptdm-sync-endpoint').value.trim();
+  const username = document.querySelector('#ptdm-sync-username').value.trim();
+  const password = document.querySelector('#ptdm-sync-password').value;
+  const register = document.querySelector('#ptdm-sync-register').checked;
+  const remember = document.querySelector('#ptdm-sync-remember').checked;
+  const button = document.querySelector('#ptdm-sync-unlock');
+  button.disabled = true;
+  try {
+    const result = await bridge.unlock({ baseUrl, username, password, register, remember });
+    syncState.unlocked = result.state;
+    syncState.snapshots = result.snapshots;
+    // 密码立刻从 DOM 里抹掉：它不是「输入框里的值」，是以后能解开全部数据的钥匙。
+    document.querySelector('#ptdm-sync-password').value = '';
+    renderSync();
+    notify('success', register ? '已创建云端保险库并解锁。' : '已解锁云端保险库。');
+  } catch (error) {
+    notify('error', error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function lockSync() {
+  syncBridge()?.lock();
+  syncState.unlocked = null;
+  syncState.snapshots = [];
+  document.querySelector('#ptdm-sync-password').value = '';
+  renderSync();
+  notify('info', '已锁定。派生密钥已从内存丢弃。');
+}
+
+async function refreshSyncSnapshots() {
+  const bridge = syncBridge();
+  if (!bridge || !syncState.unlocked) return;
+  try {
+    // 重新解锁一次代价太高（PBKDF2 60 万轮），所以「刷新」只是重读索引——
+    // 由 bridge 暴露的 list 返回当前内存索引；真正的跨设备刷新靠重新解锁。
+    syncState.snapshots = bridge.list();
+    renderSyncSnapshots();
+    notify('info', '已刷新本机看到的快照列表。跨设备的最新列表需要重新解锁。');
+  } catch (error) {
+    notify('error', error.message);
+  }
+}
+
+async function uploadSyncSnapshot() {
+  const bridge = syncBridge();
+  if (!bridge || !syncState.unlocked) return;
+  const button = document.querySelector('#ptdm-sync-upload');
+  button.disabled = true;
+  try {
+    syncState.snapshots = await bridge.upload({
+      label: selectedSyncLabel(),
+      moduleIds: selectedModules(),
+      includeSecrets: includeSecrets(),
+    });
+    renderSyncSnapshots();
+    notify('success', '已加密并上传到云端。');
+  } catch (error) {
+    notify('error', error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function downloadSyncSnapshot(snapshot) {
+  const bridge = syncBridge();
+  if (!bridge) return;
+  try {
+    const result = await bridge.download(snapshot.id);
+    const saved = await saveBlob(result.blob, result.fileName);
+    notifySavedFile('云端快照已导出', saved);
+  } catch (error) {
+    notify('error', error.message);
+  }
+}
+
+async function restoreSyncSnapshot(snapshot) {
+  const bridge = syncBridge();
+  if (!bridge) return;
+  const strategy = selectedStrategy('#ptdm-sync-strategy');
+  const replaceLocal = isCompleteLocalReplacement(strategy);
+  if (
+    !(await confirmAction(
+      `即将用云端快照「${snapshot.label}」覆盖本地数据。\n导入模式：${strategyLabel(strategy)}。\n导入前会自动创建本地恢复点。确定继续吗？`,
+      replaceLocal ? { confirmLabel: '清空并恢复', danger: true } : {},
+    ))
+  )
+    return;
+  const target = document.querySelector('#ptdm-sync-report');
+  target.classList.remove('ptdm-hidden');
+  target.textContent = '正在从云端解密快照…';
+  try {
+    const result = await bridge.download(snapshot.id);
+    const file = new File([result.blob], result.fileName, { type: 'application/zip' });
+    const form = new FormData();
+    form.set('file', file);
+    form.set('includeSecrets', String(snapshot.includeSecrets));
+    form.set('strategy', strategy);
+    form.set('createRecoveryPoint', 'true');
+    form.set('method', 'slow');
+    target.textContent = '正在导入快照（会先创建恢复点）…';
+    const response = await fetch(`${API}/import`, { method: 'POST', body: form });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `导入失败：HTTP ${response.status}`);
+    target.textContent = JSON.stringify(payload, null, 2);
+    notify('success', '云端快照已恢复，页面即将刷新。');
+    setTimeout(() => location.reload(), 500);
+  } catch (error) {
+    target.classList.remove('ptdm-hidden');
+    target.textContent = error.message;
+    notify('error', error.message);
+  }
+}
+
+async function deleteSyncSnapshot(snapshot) {
+  const bridge = syncBridge();
+  if (!bridge) return;
+  if (
+    !(await confirmAction(`从云端删除「${snapshot.label}」？这条快照在所有设备上都看不到了。`, {
+      confirmLabel: '删除',
+      danger: true,
+    }))
+  )
+    return;
+  try {
+    syncState.snapshots = await bridge.remove(snapshot.id);
+    renderSyncSnapshots();
+    notify('success', '已从云端删除。');
+  } catch (error) {
+    notify('error', error.message);
+  }
+}
+
 function bindFilePicker(dialog, inputSelector, labelSelector, preview) {
   dialog.querySelector(inputSelector).addEventListener('change', async (event) => {
     const file = event.target.files?.[0];
@@ -917,11 +1124,14 @@ function createUi() {
         <div class="ptdm-toolbar ptdm-interop-row"><input id="ptdm-tt-import-file" class="ptdm-hidden" type="file" accept=".zip,application/zip,application/x-zip-compressed"><label for="ptdm-tt-import-file" class="menu_button ptdm-file-picker">导入 TauriTavern 数据</label><span id="ptdm-tt-import-file-name" class="ptdm-muted" title="尚未选择文件">尚未选择文件</span><label class="ptdm-strategy-control" for="ptdm-tt-strategy"><span>导入模式</span><select id="ptdm-tt-strategy" aria-label="TauriTavern 导入模式">${strategyOptions()}</select></label><button id="ptdm-tt-import-confirm" class="menu_button" disabled>执行 TauriTavern 导入</button></div><div class="ptdm-muted">接受 TauriTavern / SillyTavern 导出的数据包，可独立选择冲突处理模式；导入前会自动创建恢复点。</div><pre id="ptdm-tt-preview" class="ptdm-report ptdm-hidden"></pre>
         <pre id="ptdm-report" class="ptdm-report ptdm-hidden"></pre></section>
       <section class="ptdm-section"><h3>本地恢复点</h3><div id="ptdm-backups"></div></section>
+      <section class="ptdm-section"><h3>云端同步（端到端加密）</h3><div class="ptdm-muted">快照上传前在本机加密，密钥由同步密码派生，从不上传。服务器只存密文，所以忘记密码后无法找回，也无法解密。</div><div id="ptdm-sync-status" class="ptdm-muted">未解锁。</div><div id="ptdm-sync-auth"><div class="ptdm-toolbar"><label class="ptdm-strategy-control" for="ptdm-sync-endpoint"><span>后端地址</span><input id="ptdm-sync-endpoint" type="url" placeholder="https://pure-tavern-backend.&lt;子域&gt;.workers.dev/" spellcheck="false"></label></div><div class="ptdm-toolbar"><label class="ptdm-strategy-control" for="ptdm-sync-username"><span>用户名</span><input id="ptdm-sync-username" type="text" placeholder="3–32 位小写" spellcheck="false" autocomplete="username"></label><label class="ptdm-strategy-control" for="ptdm-sync-password"><span>同步密码</span><input id="ptdm-sync-password" type="password" autocomplete="current-password"></label></div><div class="ptdm-toolbar"><label class="ptdm-check"><input id="ptdm-sync-register" type="checkbox"> 首次使用，创建新保险库</label><label class="ptdm-check"><input id="ptdm-sync-remember" type="checkbox" checked> 记住地址与用户名（不记密码）</label><button id="ptdm-sync-unlock" class="menu_button">解锁</button></div></div><div class="ptdm-toolbar ptdm-hidden" id="ptdm-sync-actions"><label class="ptdm-strategy-control" for="ptdm-sync-label"><span>快照名</span><input id="ptdm-sync-label" type="text" placeholder="留空则用时间戳"></label><button id="ptdm-sync-upload" class="menu_button ptdm-hidden">上传当前数据</button><button id="ptdm-sync-refresh" class="menu_button ptdm-hidden">刷新列表</button><button id="ptdm-sync-lock" class="menu_button ptdm-hidden">锁定</button><label class="ptdm-strategy-control" for="ptdm-sync-strategy"><span>恢复模式</span><select id="ptdm-sync-strategy" aria-label="云端快照恢复模式">${strategyOptions()}</select></label></div><div id="ptdm-sync-list">解锁后这里会列出云端快照。</div><pre id="ptdm-sync-report" class="ptdm-report ptdm-hidden"></pre></section>
     </div>`;
   document.body.appendChild(dialog);
 
   entry.querySelector('button').addEventListener('click', async () => {
     dialog.showModal();
+    prefillSyncForm();
+    renderSync();
     try {
       await refresh();
     } catch (error) {
@@ -985,11 +1195,37 @@ function createUi() {
     if (!file) return;
     void previewTauriTavernImport(file).catch((error) => notify('error', error.message));
   });
+  dialog.querySelector('#ptdm-sync-unlock').addEventListener('click', () => void unlockSync());
+  dialog
+    .querySelector('#ptdm-sync-upload')
+    .addEventListener('click', () => void uploadSyncSnapshot());
+  dialog
+    .querySelector('#ptdm-sync-refresh')
+    .addEventListener('click', () => void refreshSyncSnapshots());
+  dialog.querySelector('#ptdm-sync-lock').addEventListener('click', () => lockSync());
+  // 密码框回车直接解锁：填完密码还要去点按钮，是让人把密码重复敲一遍的唯一理由。
+  dialog.querySelector('#ptdm-sync-password').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void unlockSync();
+    }
+  });
   globalThis.__PURE_TAVERN_DATA_MANAGEMENT__ = {
     installed: true,
     open: () => entry.querySelector('button').click(),
     refresh,
   };
+}
+
+function prefillSyncForm() {
+  const bridge = syncBridge();
+  if (!bridge) return;
+  const remembered = bridge.remembered();
+  const endpoint = document.querySelector('#ptdm-sync-endpoint');
+  const username = document.querySelector('#ptdm-sync-username');
+  // 只在空的时候填，避免覆盖用户正在输入的内容。
+  if (endpoint && !endpoint.value && remembered.baseUrl) endpoint.value = remembered.baseUrl;
+  if (username && !username.value && remembered.username) username.value = remembered.username;
 }
 
 if (document.readyState === 'loading')
