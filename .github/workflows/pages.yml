@@ -1,0 +1,72 @@
+name: Deploy Web to Cloudflare Pages
+
+# Builds apps/web/dist from this repository and uploads it to the Cloudflare Pages project.
+#
+# Why this exists instead of Pages' own Git integration: the Pages project was created as a
+# Direct Uploads project, and Cloudflare does not allow attaching a Git source to one after the fact
+# (API error 8000069). This workflow achieves the same result — every push to main rebuilds the site
+# from this repository — without recreating the project and losing its domain.
+#
+# Required repository secrets:
+#   CLOUDFLARE_API_TOKEN   token with the "Cloudflare Pages — Edit" permission
+#   CLOUDFLARE_ACCOUNT_ID  account id from the Cloudflare dashboard
+#
+# The project name is configurable via the PAGES_PROJECT repository variable so a fork can point at
+# its own Pages project without editing this file.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/web/**'
+      - 'packages/**'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'package.json'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Build and deploy web
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.17.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build web
+        run: pnpm --filter @pure-tavern/web build
+
+      - name: Verify build output
+        run: |
+          test -f apps/web/dist/index.html
+          du -sh apps/web/dist
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy apps/web/dist --project-name=${{ vars.PAGES_PROJECT || 'pure-tavern' }} --branch=main
